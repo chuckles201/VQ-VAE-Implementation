@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F 
-
+from vq import VectorQuantization
 
 
 '''Residual Block that does
@@ -27,6 +27,7 @@ class ResBlock(nn.Module):
         
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.norm = nn.GroupNorm(32,out_channels)
         
         # keeps dimensionality!
         self.conv_1 = nn.Conv2d(in_channels,out_channels,kernel_size=3,padding=1)
@@ -43,14 +44,11 @@ class ResBlock(nn.Module):
         # B,In,H,W -> B,out,h,w (for both)
         residue = self.resid_map(x)
         x = self.conv_1(x)
+        x = self.norm(x)
         x = self.relu(x)
         
         return x + residue
-    
-# test: (B,C,H,W) -> (B,C_out,H,W)
-t = torch.randn([32,25,256,256])
-t_resblock = ResBlock(25,50)
-print(t_resblock(t).shape)
+
 
 
 '''Same block, but takes down dimensionality X2
@@ -66,6 +64,7 @@ class DownBlock(nn.Module):
         self.out_channels = out_channels
         
         # halves spatial-dims
+        self.norm = nn.GroupNorm(32,out_channels)
         self.conv_1 = nn.Conv2d(in_channels,out_channels,kernel_size=4,padding=1,stride=2)
         self.relu = nn.LeakyReLU()
         
@@ -74,14 +73,10 @@ class DownBlock(nn.Module):
         # B,In,H,W -> B,out,h,w (for both)
         x = self.conv_1(x)
         x = self.relu(x)
+        x = self.norm(x)
         
         return x 
     
-# test: (B,C,H,W) -> (B,C_out,H/2,W/2)
-t = torch.randn([32,25,256,256])
-downblock = DownBlock(25,25)
-print(downblock(t).shape) 
-
 
 '''Encoder for VAE, made up of residual
 blocks, with MLPs and downsampling to increase
@@ -101,7 +96,7 @@ We will have
 Is there a reason for having a certain config?
 ''' 
 
-
+# TODO: groupnorm add?
 class Encoder(nn.Module):
     def __init__(self,in_channels=3):
         super().__init__()
@@ -111,9 +106,11 @@ class Encoder(nn.Module):
         self.layers = nn.Sequential(
             ResBlock(in_channels,128),
             DownBlock(128,128),
-            ResBlock(128,256),
+            ResBlock(128,128),
+            DownBlock(128,256),
+            ResBlock(256,256),
             DownBlock(256,256)
-            # FINAL: (B,256,H/4,W/4)
+            # FINAL: (B,256,H/8,W/8)
         )
         
     def forward(self,x):
@@ -122,20 +119,70 @@ class Encoder(nn.Module):
         return self.relu(x)
     
 
-
-# very fast this way!
-device='cuda'        
-t = torch.randn([32,3,256,256],device=device) 
-encoder = Encoder().to(device)
-t_out = encoder(t)
-print(t.shape)
-
+##########################################
 
 '''Decoder: will
 - select the embedding based on the one-hot
 representations
 - upsample and decrease channel-dims to match
 original image.
-
-
 '''
+
+
+class Decoder(nn.Module):
+    def __init__(self,out_channels=3):
+        super().__init__()
+        self.conv_final = nn.Conv2d(64,out_channels,1,1,0)
+        self.sig = nn.Sigmoid()
+        
+        self.layers = nn.Sequential(
+            # going backwards, replacing
+            # w/ upsamples
+            ResBlock(256,256),
+            nn.Upsample(scale_factor=2,mode='nearest'),
+            ResBlock(256,128),
+            ResBlock(128,128),
+            nn.Upsample(scale_factor=2,mode='nearest'),
+            ResBlock(128,64),
+            ResBlock(64,64),
+            nn.Upsample(scale_factor=2,mode='nearest'),
+            ResBlock(64,64),
+            # FINAL: (B,3,H,W)
+        )
+    
+    def forward(self,x):
+        x = self.layers(x)
+        x = self.conv_final(x)
+        x = self.sig(x)
+        return x
+    
+
+
+# # testing encoder and decoder
+
+# import time
+# # very fast this way!
+# device='cuda'        
+# t = torch.randn([32,3,256,256],device=device) 
+# encoder = Encoder().to(device)
+# decoder = Decoder().to(device)
+
+# start = time.time()
+# t_out = decoder(encoder(t))
+# end = time.time() - start
+# print(t_out.shape, "   |    time :",end)
+
+class VQVAE(nn.Module):
+    def __init__(self,n_embed=512,d_embed=256,device='cpu'):
+        super().__init__()
+        self.encoder = Encoder()
+        self.decoder = Decoder()
+        self.vq = VectorQuantization(n_embed,d_embed,beta=0.3,device=device)
+    
+        
+    def forward(self,x):
+        x = self.encoder(x)
+        x,loss = self.vq(x)
+        x = self.decoder(x)
+        return x,loss
+
